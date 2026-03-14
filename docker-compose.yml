@@ -1,0 +1,373 @@
+version: '3.8'
+
+services:
+  # ==========================================
+  # DATABASE SERVICES
+  # ==========================================
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: influencer_platform_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-platform}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-platform_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-influencer_platform}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/alembic/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-platform}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - platform_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: influencer_platform_redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis_secret}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - platform_network
+
+  # ==========================================
+  # SEARCH & ANALYTICS
+  # ==========================================
+  meilisearch:
+    image: getmeili/meilisearch:v1.6
+    container_name: influencer_platform_meilisearch
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-meili_secret_key}
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - meilisearch_data:/meili_data
+    ports:
+      - "7700:7700"
+    networks:
+      - platform_network
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.1
+    container_name: influencer_platform_clickhouse
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-analytics}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-analytics}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-analytics_secret}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./infra/clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "8123:8123"  # HTTP
+      - "9000:9000"  # Native
+    networks:
+      - platform_network
+
+  qdrant:
+    image: qdrant/qdrant:v1.7
+    container_name: influencer_platform_qdrant
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "6333:6333"
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-qdrant_secret}
+    networks:
+      - platform_network
+
+  # ==========================================
+  # STORAGE
+  # ==========================================
+  minio:
+    image: minio/minio:RELEASE.2024-01-18T22-51-28Z
+    container_name: influencer_platform_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BROWSER_REDIRECT_URL: http://localhost:9001
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - platform_network
+
+  # ==========================================
+  # BACKEND SERVICES
+  # ==========================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: influencer_platform_backend
+    environment:
+      # Database
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-platform}:${POSTGRES_PASSWORD:-platform_secret}@postgres:5432/${POSTGRES_DB:-influencer_platform}
+      SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-platform}:${POSTGRES_PASSWORD:-platform_secret}@postgres:5432/${POSTGRES_DB:-influencer_platform}
+      
+      # Redis
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379/0
+      
+      # Search
+      MEILISEARCH_URL: http://meilisearch:7700
+      MEILISEARCH_API_KEY: ${MEILI_MASTER_KEY:-meili_secret_key}
+      
+      # Vector DB
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-qdrant_secret}
+      
+      # Analytics
+      CLICKHOUSE_URL: http://${CLICKHOUSE_USER:-analytics}:${CLICKHOUSE_PASSWORD:-analytics_secret}@clickhouse:8123/${CLICKHOUSE_DB:-analytics}
+      
+      # Storage
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-influencer-platform}
+      
+      # Security
+      SECRET_KEY: ${SECRET_KEY:-super_secret_key_change_in_production}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-7}
+      
+      # AI Services
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      
+      # Platform APIs
+      YOUTUBE_API_KEY: ${YOUTUBE_API_KEY}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      TWITTER_BEARER_TOKEN: ${TWITTER_BEARER_TOKEN}
+      
+      # Environment
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DEBUG: ${DEBUG:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      
+      # Workers
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379/2
+    volumes:
+      - ./backend:/app
+      - backend_logs:/app/logs
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      meilisearch:
+        condition: service_started
+      clickhouse:
+        condition: service_started
+      qdrant:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    networks:
+      - platform_network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ==========================================
+  # WORKER SERVICES
+  # ==========================================
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: influencer_platform_celery_worker
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-platform}:${POSTGRES_PASSWORD:-platform_secret}@postgres:5432/${POSTGRES_DB:-influencer_platform}
+      SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-platform}:${POSTGRES_PASSWORD:-platform_secret}@postgres:5432/${POSTGRES_DB:-influencer_platform}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379/2
+      MEILISEARCH_URL: http://meilisearch:7700
+      MEILISEARCH_API_KEY: ${MEILI_MASTER_KEY:-meili_secret_key}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-qdrant_secret}
+      CLICKHOUSE_URL: http://${CLICKHOUSE_USER:-analytics}:${CLICKHOUSE_PASSWORD:-analytics_secret}@clickhouse:8123/${CLICKHOUSE_DB:-analytics}
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-influencer-platform}
+      SECRET_KEY: ${SECRET_KEY:-super_secret_key_change_in_production}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      YOUTUBE_API_KEY: ${YOUTUBE_API_KEY}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./backend:/app
+      - backend_logs:/app/logs
+    depends_on:
+      - postgres
+      - redis
+      - backend
+    networks:
+      - platform_network
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4 -Q default,ingestion,ai_processing,scoring
+
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: influencer_platform_celery_beat
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-platform}:${POSTGRES_PASSWORD:-platform_secret}@postgres:5432/${POSTGRES_DB:-influencer_platform}
+      SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-platform}:${POSTGRES_PASSWORD:-platform_secret}@postgres:5432/${POSTGRES_DB:-influencer_platform}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379/2
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      YOUTUBE_API_KEY: ${YOUTUBE_API_KEY}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - postgres
+      - redis
+      - backend
+    networks:
+      - platform_network
+    command: celery -A app.workers.celery_app beat --loglevel=info
+
+  celery_flower:
+    image: mher/flower:2.0
+    container_name: influencer_platform_flower
+    environment:
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379/1
+      FLOWER_PORT: 5555
+      FLOWER_BASIC_AUTH: ${FLOWER_AUTH:-admin:admin}
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+      - celery_worker
+    networks:
+      - platform_network
+
+  # ==========================================
+  # FRONTEND
+  # ==========================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: influencer_platform_frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_WS_URL: ws://localhost:8000
+      NEXT_PUBLIC_ENVIRONMENT: ${ENVIRONMENT:-development}
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - platform_network
+    command: npm run dev
+
+  # ==========================================
+  # MONITORING
+  # ==========================================
+  prometheus:
+    image: prom/prometheus:v2.49
+    container_name: influencer_platform_prometheus
+    volumes:
+      - ./infra/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - platform_network
+
+  grafana:
+    image: grafana/grafana:10.3
+    container_name: influencer_platform_grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./infra/monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - platform_network
+
+  # ==========================================
+  # INIT SERVICE
+  # ==========================================
+  init:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: influencer_platform_init
+    environment:
+      SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-platform}:${POSTGRES_PASSWORD:-platform_secret}@postgres:5432/${POSTGRES_DB:-influencer_platform}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-influencer-platform}
+      MEILISEARCH_URL: http://meilisearch:7700
+      MEILISEARCH_API_KEY: ${MEILI_MASTER_KEY:-meili_secret_key}
+    volumes:
+      - ./backend:/app
+      - ./scripts/init.sh:/init.sh
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      meilisearch:
+        condition: service_started
+    networks:
+      - platform_network
+    command: /init.sh
+    restart: "no"
+
+volumes:
+  postgres_data:
+  redis_data:
+  meilisearch_data:
+  clickhouse_data:
+  qdrant_data:
+  minio_data:
+  backend_logs:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  platform_network:
+    driver: bridge
